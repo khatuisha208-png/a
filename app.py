@@ -1,91 +1,103 @@
 import streamlit as st
 import pandas as pd
-import google.generativeai as genai
+import whisper
+import groq
 import tempfile
 import os
-import time
+import json
+import csv
 
-st.set_page_config(page_title="StayVista Free Acquisition Tool", page_icon="🏡", layout="wide")
+# --- PAGE SETUP ---
+st.set_page_config(page_title="StayVista Acquisition Portal", page_icon="🏡", layout="wide")
 
 # --- INITIALIZE SESSION STATE ---
-if 'master_data' not in st.session_state:
-    st.session_state.master_data = pd.DataFrame(
-        columns=["Villa Name", "Location", "BHK", "USP", "Expected Rent", "Manager Name", "Summary"]
-    )
+if 'master_df' not in st.session_state:
+    st.session_state.master_df = pd.DataFrame()
 
-st.title("🏡 StayVista Acquisition (Free Tier)")
-st.markdown("Powered by Google Gemini. Upload video or audio for free extraction.")
+# --- LOAD MODELS ---
+@st.cache_resource
+def load_whisper():
+    return whisper.load_model("base")
 
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("Setup")
-    # Get your free key at https://aistudio.google.com/
-    api_key = st.text_input("Enter Gemini API Key", type="password")
-    if st.button("🗑️ Clear Master List"):
-        st.session_state.master_data = pd.DataFrame(columns=st.session_state.master_data.columns)
-        st.rerun()
+whisper_model = load_whisper()
 
-# --- APP LOGIC ---
-if api_key:
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+# --- GITHUB SECRETS / SIDEBAR ---
+# On Streamlit Cloud, add GROQ_API_KEY to "Settings > Secrets"
+api_key = st.secrets.get("GROQ_API_KEY") or st.sidebar.text_input("Groq API Key", type="password")
 
-    uploaded_file = st.file_uploader("Upload Walkthrough (Video/Audio)", type=["mp4", "mov", "mp3", "wav", "m4a"])
+if not api_key:
+    st.warning("Please add your Groq API Key to proceed.")
+    st.stop()
 
-    if uploaded_file:
-        if st.button("➕ Process Villa"):
-            with st.status("Gemini is analyzing media...", expanded=True) as status:
-                try:
-                    # Save file locally
-                    suffix = os.path.splitext(uploaded_file.name)[1]
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                        tmp.write(uploaded_file.read())
-                        tmp_path = tmp.name
+groq_client = groq.Groq(api_key=api_key)
 
-                    # Upload to Google Flash Storage (Temporary)
-                    st.write("📤 Uploading to Google AI Studio...")
-                    gv_file = genai.upload_file(path=tmp_path)
-                    
-                    # Wait for processing
-                    while gv_file.state.name == "PROCESSING":
-                        time.sleep(2)
-                        gv_file = genai.get_file(gv_file.name)
+st.title("🏡 StayVista Villa Acquisition")
+st.markdown("Upload walkthrough videos/audio to generate structured CSVs and summaries.")
 
-                    # Prompt for extraction
-                    st.write("🧠 Extracting structured data...")
-                    prompt = """
-                    Act as a property acquisition manager. Extract the following details from this media:
-                    Villa Name, Location, BHK, USP, Expected Rent, Manager Name.
-                    Also provide a short summary.
-                    
-                    Return ONLY the values separated by a pipe (|) in this exact order:
-                    Villa Name|Location|BHK|USP|Expected Rent|Manager Name|Summary
-                    """
-                    
-                    response = model.generate_content([gv_file, prompt])
-                    
-                    # Parse output
-                    data_row = response.text.strip().split("|")
-                    
-                    if len(data_row) >= 7:
-                        new_entry = pd.DataFrame([data_row[:7]], columns=st.session_state.master_data.columns)
-                        st.session_state.master_data = pd.concat([st.session_state.master_data, new_entry], ignore_index=True)
-                        status.update(label="✅ Added to Master List!", state="complete")
-                    else:
-                        st.error("AI returned unexpected format. Try a clearer recording.")
-                    
-                    # Cleanup
-                    genai.delete_file(gv_file.name)
-                    os.remove(tmp_path)
+# --- FILE UPLOADER ---
+uploaded_file = st.file_uploader("Upload Video or Audio", type=["mp4", "mov", "m4a", "mp3", "wav"])
 
-                except Exception as e:
-                    st.error(f"Error: {e}")
+if uploaded_file:
+    # Save file to temp
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
 
-# --- DISPLAY TABLE ---
+    if st.button("🚀 Process Property"):
+        with st.status("Processing...", expanded=True) as status:
+            # 1. Transcribe
+            st.write("🎤 Transcribing & Translating...")
+            result = whisper_model.transcribe(tmp_path, task="translate")
+            transcript = result["text"]
+            
+            # 2. Extract with Groq
+            st.write("🤖 Extracting Data with Llama 3...")
+            from prompts import SYSTEM_PROMPT # We will move your long prompt to a separate file
+            
+            chat_completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": st.secrets.get("SYSTEM_PROMPT")}, # Store prompt in secrets or a file
+                    {"role": "user", "content": f"Transcription:\n\n{transcript}"}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            
+            res_json = json.loads(chat_completion.choices[0].message.content)
+            summary = res_json["summary"]
+            csv_data = res_json["csv_data"]
+
+            # 3. Add to Session Table
+            new_row = pd.DataFrame([csv_data])
+            st.session_state.master_df = pd.concat([st.session_state.master_df, new_row], ignore_index=True)
+            
+            status.update(label="✅ Processing Complete!", state="complete")
+
+        # --- DISPLAY INDIVIDUAL RESULTS ---
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.subheader("📝 Property Summary")
+            st.text_area("Summary Output", value=summary, height=300)
+        with col2:
+            st.subheader("📊 Extracted Data")
+            st.write(csv_data)
+
+    os.remove(tmp_path)
+
+# --- MASTER TABLE & DOWNLOAD ---
 st.divider()
-if not st.session_state.master_data.empty:
-    st.dataframe(st.session_state.master_data, use_container_width=True)
-    csv = st.session_state.master_data.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Master CSV", data=csv, file_name="stayvista_acquisition.csv", mime="text/csv")
-else:
-    st.info("Enter API Key and upload a file to begin.")
+if not st.session_state.master_df.empty:
+    st.subheader("📋 Cumulative Acquisition List")
+    st.dataframe(st.session_state.master_df)
+    
+    csv_bytes = st.session_state.master_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Master CSV File",
+        data=csv_bytes,
+        file_name="stayvista_acquisition_batch.csv",
+        mime="text/csv"
+    )
+    if st.button("🗑️ Reset Table"):
+        st.session_state.master_df = pd.DataFrame()
+        st.rerun()
