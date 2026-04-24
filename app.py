@@ -4,76 +4,108 @@ from openai import OpenAI
 import tempfile
 import os
 
-st.set_page_config(page_title="StayVista Multi-Acquisition", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="StayVista Acquisition Portal", page_icon="🏡", layout="wide")
 
 # --- INITIALIZE SESSION STATE ---
-# This keeps your data alive while you upload multiple videos
 if 'master_data' not in st.session_state:
     st.session_state.master_data = pd.DataFrame(
         columns=["Villa Name", "Location", "BHK", "USP", "Expected Rent", "Manager Name", "Summary"]
     )
 
-st.title("🏠 StayVista Acquisition: Bulk Processor")
-st.markdown("Upload videos one by one. The table below will collect all data into a single file.")
+st.title("🏡 StayVista Acquisition: Multi-Format Processor")
+st.markdown("Upload **Video walkthroughs** or **Audio recordings**. Data will be aggregated into the table below.")
 
 # --- SIDEBAR ---
 with st.sidebar:
-    api_key = st.text_input("OpenAI API Key", type="password")
-    if st.button("Clear All Data"):
+    st.header("Configuration")
+    api_key = st.text_input("Enter OpenAI API Key", type="password")
+    st.divider()
+    if st.button("🗑️ Clear Master List"):
         st.session_state.master_data = pd.DataFrame(columns=st.session_state.master_data.columns)
         st.rerun()
 
 # --- UPLOAD SECTION ---
-uploaded_file = st.file_uploader("Upload Villa Walkthrough", type=["mp4", "mov", "avi"])
+# Added support for audio formats (mp3, wav, m4a)
+uploaded_file = st.file_uploader(
+    "Upload Villa Walkthrough (Video or Audio)", 
+    type=["mp4", "mov", "avi", "mp3", "wav", "m4a"]
+)
 
 if uploaded_file and api_key:
     client = OpenAI(api_key=api_key)
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+    # Get the file extension to handle temp file creation properly
+    file_extension = os.path.splitext(uploaded_file.name)[1]
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
         tmp_file.write(uploaded_file.read())
-        video_path = tmp_file.name
+        temp_file_path = tmp_file.name
 
-    if st.button("➕ Add to Master List"):
-        with st.status("Processing Video...", expanded=True) as status:
-            st.write("Transcribing audio...")
-            with open(video_path, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file).text
-            
-            st.write("Extracting details...")
-            prompt = f"Extract details from this StayVista villa transcript: '{transcript}'. Return format: Villa Name|Location|BHK|USP|Expected Rent|Manager Name|3-sentence Summary"
-            
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            # Parse and Append
-            data_row = response.choices[0].message.content.strip().split("|")
-            
-            # Add to the Session State DataFrame
-            new_entry = pd.DataFrame([data_row], columns=st.session_state.master_data.columns)
-            st.session_state.master_data = pd.concat([st.session_state.master_data, new_entry], ignore_index=True)
-            
-            status.update(label="Villa Added Successfully!", state="complete")
-        
-        os.remove(video_path)
+    if st.button("➕ Process & Add to List"):
+        with st.status("Analyzing Media...", expanded=True) as status:
+            try:
+                # 1. Transcription (Whisper handles both audio and video natively)
+                st.write("🎤 Transcribing...")
+                with open(temp_file_path, "rb") as media_file:
+                    transcript = client.audio.transcriptions.create(
+                        model="whisper-1", 
+                        file=media_file
+                    ).text
+                
+                # 2. Structured Extraction
+                st.write("🤖 Extracting Villa details...")
+                prompt = f"""
+                Analyze this StayVista acquisition transcript: "{transcript}"
+                Extract: Villa Name, Location, BHK, USP, Expected Rent, Manager Name.
+                Also provide a 2-sentence summary.
+                
+                Return exactly in this format:
+                NAME|LOCATION|BHK|USP|RENT|MANAGER|SUMMARY
+                """
+                
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                
+                # 3. Parse and Append
+                raw_data = response.choices[0].message.content.strip()
+                data_row = raw_data.split("|")
+                
+                # Ensure the row matches the column length
+                if len(data_row) == 7:
+                    new_entry = pd.DataFrame([data_row], columns=st.session_state.master_data.columns)
+                    st.session_state.master_data = pd.concat([st.session_state.master_data, new_entry], ignore_index=True)
+                    status.update(label="✅ Added successfully!", state="complete")
+                else:
+                    st.error("AI output format error. Please try again.")
+                    
+            except Exception as e:
+                st.error(f"Error: {e}")
+            finally:
+                os.remove(temp_file_path)
 
-# --- DISPLAY MASTER LIST ---
+# --- DISPLAY & EXPORT ---
 st.divider()
-st.subheader("📋 Master Acquisition List")
+st.subheader("📋 Accumulated Acquisition Data")
 
 if not st.session_state.master_data.empty:
-    # Display the table
+    # Interactive Table
     st.dataframe(st.session_state.master_data, use_container_width=True)
 
-    # Download Button for the entire accumulated file
+    # Multi-format export
+    col1, col2 = st.columns(2)
+    
     csv = st.session_state.master_data.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Download Master CSV (All Villas)",
+    
+    col1.download_button(
+        label="📥 Download Master CSV",
         data=csv,
-        file_name="stayvista_acquisition_batch.csv",
+        file_name="stayvista_master_list.csv",
         mime="text/csv",
         type="primary"
     )
+    
+    col2.info(f"Total Villas Processed: {len(st.session_state.master_data)}")
 else:
-    st.info("No villas added yet. Upload a video above to start the list.")
+    st.info("The list is currently empty. Upload media to begin.")
