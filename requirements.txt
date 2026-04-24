@@ -1,6 +1,5 @@
 streamlit
 groq
 openai-whisper
-torch
 pandas
-ffmpeg-python
+google-generativeai
